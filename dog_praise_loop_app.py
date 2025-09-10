@@ -18,7 +18,15 @@ os.makedirs(PHRASES_DIR, exist_ok=True)
 def get_phrases():
     files = [os.path.join(PHRASES_DIR, f) for f in os.listdir(PHRASES_DIR) if f.endswith('.wav')]
     files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-    return [os.path.basename(f) for f in files]
+    return [os.path.basename(f) for f in files if is_valid_wav_file(f)]
+
+def is_valid_wav_file(filepath):
+    """Check if a file is a valid WAV file by trying to load it with pydub."""
+    try:
+        sound = AudioSegment.from_file(filepath)
+        return len(sound) > 0  # Must have some duration
+    except Exception:
+        return False
 
 # HTML UI with user-triggered autoplay loop
 HTML = '''
@@ -250,6 +258,12 @@ HTML = '''
         let loopRunning = false;
         let praiseTimeout;
         let countdownInterval;
+        let playbackFallbackTimer = null;
+        let retryCount = 0;
+        const MAX_RETRIES = 3;
+        let lastActivityTime = Date.now();
+        let heartbeatInterval = null;
+        let isPlayingPhrase = false;
 
         // Elements
         const player = document.getElementById('player');
@@ -372,7 +386,7 @@ HTML = '''
             recordBtn.classList.remove('recording');
             
             mediaRecorder.addEventListener('stop', async () => {
-                const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+                const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
                 const formData = new FormData();
                 formData.append('audio_data', audioBlob);
                 formData.append('trim_silence', trimSilenceCheckbox.checked);
@@ -417,6 +431,23 @@ HTML = '''
             loopBtn.textContent = 'Stop Loop';
             loopBtn.className = 'stop';
             statusIndicator.classList.add('active');
+            retryCount = 0; // Reset retry count when starting fresh
+            lastActivityTime = Date.now();
+            
+            // Start heartbeat to detect stalled loops
+            heartbeatInterval = setInterval(() => {
+                const timeSinceActivity = Date.now() - lastActivityTime;
+                const maxPauseMs = parseFloat(maxPauseInput.value) * 1000;
+                const stallThreshold = maxPauseMs + 30000; // Max pause + 30 seconds buffer
+                
+                if (timeSinceActivity > stallThreshold) {
+                    console.warn(`Loop appears stalled (${Math.round(timeSinceActivity/1000)}s since last activity). Restarting...`);
+                    statusText.textContent = 'Loop stalled - restarting...';
+                    lastActivityTime = Date.now();
+                    playRandomPhrase();
+                }
+            }, 10000); // Check every 10 seconds
+            
             playRandomPhrase();
         }
 
@@ -432,30 +463,128 @@ HTML = '''
         function clearTimers() {
             clearTimeout(praiseTimeout);
             clearInterval(countdownInterval);
+            clearTimeout(playbackFallbackTimer);
+            clearInterval(heartbeatInterval);
         }
 
         async function playRandomPhrase() {
+            if (isPlayingPhrase) {
+                console.log('Already attempting to play a phrase, skipping...');
+                return;
+            }
+            
+            isPlayingPhrase = true;
+            console.log(`Attempting to play random phrase... (attempt ${retryCount + 1}/${MAX_RETRIES + 1})`);
             clearTimers();
+            
             try {
                 const res = await fetch('/random_praise');
                 if (!res.ok) {
-                    statusText.textContent = 'No phrases to play.';
-                    stopLoop();
-                    return;
+                    throw new Error(`Fetch failed with status: ${res.status}`);
                 }
                 const blob = await res.blob();
                 player.src = URL.createObjectURL(blob);
-                await player.play();
-                statusText.textContent = 'Playing...';
+                
+                // Set up fallback timer based on audio duration
+                player.addEventListener('loadedmetadata', () => {
+                    if (isFinite(player.duration) && player.duration > 0) {
+                        const durationMs = player.duration * 1000;
+                        console.log(`Audio duration: ${player.duration}s, setting fallback timer for ${durationMs + 2000}ms`);
+                        playbackFallbackTimer = setTimeout(() => {
+                            console.warn('Fallback timer fired - audio ended event may have been missed due to browser throttling');
+                            isPlayingPhrase = false; // Reset the playing flag
+                            if (loopRunning) {
+                                scheduleNextPlay();
+                            }
+                        }, durationMs + 2000); // 2 second buffer
+                    } else {
+                        console.warn('Audio duration not available, setting 10 second fallback');
+                        playbackFallbackTimer = setTimeout(() => {
+                            console.warn('Emergency fallback timer fired - no audio duration available');
+                            isPlayingPhrase = false; // Reset the playing flag
+                            if (loopRunning) {
+                                scheduleNextPlay();
+                            }
+                        }, 10000); // 10 second emergency fallback
+                    }
+                }, { once: true });
+                
+                // Also set up an error handler
+                player.addEventListener('error', (e) => {
+                    console.error('Audio error:', e, player.error);
+                    isPlayingPhrase = false; // Reset the playing flag
+                    statusText.textContent = 'Audio error - retrying...';
+                    if (loopRunning) {
+                        setTimeout(() => {
+                            if (loopRunning) {
+                                scheduleNextPlay();
+                            }
+                        }, 2000);
+                    }
+                }, { once: true });
+                
+                // Attempt to play with timeout protection
+                const playTimeout = setTimeout(() => {
+                    console.warn('Play attempt timed out after 5 seconds');
+                    isPlayingPhrase = false; // Reset the playing flag
+                    statusText.textContent = 'Play timeout - retrying...';
+                    if (loopRunning) {
+                        scheduleNextPlay();
+                    }
+                }, 5000);
+                
+                try {
+                    await player.play();
+                    clearTimeout(playTimeout);
+                    statusText.textContent = 'Playing...';
+                    console.log('Playback started successfully.');
+                    retryCount = 0; // Reset retry count on successful play
+                    lastActivityTime = Date.now(); // Update activity timestamp
+                    // Don't reset isPlayingPhrase here - let the 'ended' event handle it
+                } catch (playError) {
+                    clearTimeout(playTimeout);
+                    isPlayingPhrase = false; // Reset on error
+                    console.error("Autoplay prevented or playback error:", playError);
+                    statusText.textContent = 'Playback blocked - trying again...';
+                    
+                    // Wait a bit and try to continue the loop
+                    setTimeout(() => {
+                        if (loopRunning) {
+                            scheduleNextPlay();
+                        }
+                    }, 3000);
+                }
+
             } catch (error) {
-                console.error("Playback error:", error);
-                statusText.textContent = 'Error. Check console.';
-                stopLoop();
+                isPlayingPhrase = false; // Reset on error
+                console.error("Fetch or general playback error:", error);
+                retryCount++;
+                
+                if (retryCount <= MAX_RETRIES && loopRunning) {
+                    statusText.textContent = `Connection error, retrying... (${retryCount}/${MAX_RETRIES})`;
+                    console.log(`Retrying in 3 seconds... (attempt ${retryCount}/${MAX_RETRIES})`);
+                    
+                    setTimeout(() => {
+                        if (loopRunning) {
+                            playRandomPhrase();
+                        }
+                    }, 3000);
+                } else {
+                    statusText.textContent = 'Too many errors - loop stopped';
+                    console.error('Max retries exceeded, stopping loop');
+                    stopLoop();
+                }
             }
         }
 
         function scheduleNextPlay() {
-            if (!loopRunning) return;
+            console.log('Scheduling next play...');
+            lastActivityTime = Date.now(); // Update activity timestamp
+            
+            if (!loopRunning) {
+                console.log('Loop not running, not scheduling.');
+                return;
+            }
             clearTimers();
 
             const minPause = parseFloat(minPauseInput.value) * 1000;
@@ -463,11 +592,18 @@ HTML = '''
             const delay = Math.random() * (maxPause - minPause) + minPause;
             const endTime = Date.now() + delay;
 
+            console.log(`Next play scheduled in ${delay / 1000} seconds.`);
+
             function updateCountdown() {
                 const remaining = endTime - Date.now();
                 if (remaining <= 0) {
                     clearInterval(countdownInterval);
-                    if(loopRunning) playRandomPhrase();
+                    if(loopRunning) {
+                        console.log('Countdown finished, playing next phrase.');
+                        playRandomPhrase();
+                    } else {
+                        console.log('Countdown finished, but loop stopped.');
+                    }
                     return;
                 }
                 statusText.textContent = `Next praise in ${Math.ceil(remaining / 1000)}s...`;
@@ -477,7 +613,12 @@ HTML = '''
             updateCountdown();
         }
 
-        player.addEventListener('ended', scheduleNextPlay);
+        player.addEventListener('ended', () => {
+            console.log('Audio ended event fired normally.');
+            isPlayingPhrase = false; // Reset the playing flag
+            clearTimeout(playbackFallbackTimer); // Cancel fallback since normal event fired
+            scheduleNextPlay();
+        });
 
         // Initial Load
         document.addEventListener('DOMContentLoaded', fetchPhrases);
@@ -523,38 +664,46 @@ def add_phrase():
     audio_file = request.files['audio_data']
     trim_silence = request.form.get('trim_silence') == 'true'
 
-    # Generate a unique filename
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"praise_{timestamp}.wav"
     filepath = os.path.join(PHRASES_DIR, filename)
     
-    # Save the initial audio file
-    audio_file.save(filepath)
+    # Save uploaded file with temporary extension
+    temp_filepath = filepath + ".tmp"
+    audio_file.save(temp_filepath)
 
-    # If trimming is requested, process the file
-    if trim_silence:
-        sound = AudioSegment.from_file(filepath, format="wav")
+    try:
+        # Convert to WAV format (handles WebM, MP3, etc.)
+        sound = AudioSegment.from_file(temp_filepath)
+        sound.export(filepath, format="wav")
+        
+        # Remove temporary file
+        os.remove(temp_filepath)
 
-        # Find non-silent chunks
-        # Using a silence threshold of -16dB relative to the file's max dBFS
-        # and a minimum silence length of 400ms
-        nonsilent_chunks = detect_nonsilent(
-            sound, 
-            min_silence_len=400, 
-            silence_thresh=sound.dBFS - 16
-        )
-
-        if nonsilent_chunks:
-            # Get the start of the first non-silent chunk and the end of the last one
-            start_trim = nonsilent_chunks[0][0]
-            end_trim = nonsilent_chunks[-1][1]
-            trimmed_sound = sound[start_trim:end_trim]
-            
-            # Overwrite the original file with the trimmed version
-            trimmed_sound.export(filepath, format="wav")
+        if trim_silence:
+            sound = AudioSegment.from_file(filepath, format="wav") # Re-load the clean wav
+            if sound.dBFS != float('-inf'):
+                nonsilent_chunks = detect_nonsilent(
+                    sound,
+                    min_silence_len=400,
+                    silence_thresh=sound.dBFS - 16
+                )
+                if nonsilent_chunks:
+                    start_trim = nonsilent_chunks[0][0]
+                    end_trim = nonsilent_chunks[-1][1]
+                    trimmed_sound = sound[start_trim:end_trim]
+                    trimmed_sound.export(filepath, format="wav")
+    except Exception as e:
+        # If any pydub processing fails, delete the bad files
+        print(f"Error processing audio file {filename}: {e}")
+        if os.path.exists(temp_filepath):
+            os.remove(temp_filepath)
+        if os.path.exists(filepath):
+            os.remove(filepath)
+        return "Error processing audio file", 500
 
     return jsonify({"success": True, "filename": filename})
-
+    
 @app.route('/delete_phrase', methods=['POST'])
 def delete_phrase():
     data = request.get_json()
