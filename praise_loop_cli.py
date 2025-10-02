@@ -12,22 +12,33 @@ import time
 import subprocess
 import sys
 from pathlib import Path
+import threading
 
 def is_valid_audio_file(file_path):
-    """Test if an audio file can be played."""
+    """Test if an audio file is valid without playing it."""
     try:
         if sys.platform == "darwin":  # macOS
+            # Use afinfo to check file validity without playing
             result = subprocess.run(
-                ["afplay", str(file_path)], 
+                ["afinfo", str(file_path)], 
                 capture_output=True, 
-                timeout=1  # Quick test
+                timeout=5
             )
             return result.returncode == 0
-        # For other platforms, assume valid for now
+        elif sys.platform.startswith("linux"):  # Linux
+            # Use file command to check if it's a valid audio file
+            result = subprocess.run(
+                ["file", "--mime-type", str(file_path)], 
+                capture_output=True, 
+                timeout=5
+            )
+            if result.returncode == 0:
+                output = result.stdout.decode().lower()
+                return "audio/" in output
+        # For other platforms, assume valid
         return True
-    except (subprocess.TimeoutExpired, Exception):
-        # If it times out, it's probably playing (valid)
-        return True
+    except Exception:
+        return False
 
 def get_audio_files(directory):
     """Get all valid .wav files from the phrases directory."""
@@ -91,15 +102,42 @@ def play_audio_file(file_path):
         return False
     return True
 
+def start_caffeinate():
+    """Start caffeinate process to prevent system sleep on macOS."""
+    if sys.platform == "darwin":
+        try:
+            # Use caffeinate to prevent idle sleep
+            process = subprocess.Popen(
+                ["caffeinate", "-i"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            return process
+        except FileNotFoundError:
+            print("⚠️  caffeinate not found, falling back to basic daemon")
+            return None
+    return None
+
+def keep_awake_daemon():
+    """Background thread to prevent system sleep by periodically running a harmless command."""
+    while True:
+        try:
+            # Run a harmless command every 4 minutes to prevent sleep
+            subprocess.run(["date"], capture_output=True, timeout=5)
+        except Exception:
+            pass
+        time.sleep(240)  # 4 minutes
+
 def main():
     parser = argparse.ArgumentParser(
         description="Play random praise clips for Caroline at random intervals",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s                    # Use defaults: 2-10 second intervals, phrases/ directory
+  %(prog)s                    # Use defaults: 2-4 second intervals, phrases/ directory
   %(prog)s --min 5 --max 15   # 5-15 second intervals
   %(prog)s --dir ./sounds     # Use ./sounds directory instead of phrases/
+  %(prog)s --use-daemon       # Use daemon thread instead of caffeinate on macOS
   %(prog)s --min 1 --max 3 --dir custom_phrases/
         """
     )
@@ -114,8 +152,8 @@ Examples:
     parser.add_argument(
         "--max", 
         type=float, 
-        default=10.0,
-        help="Maximum pause between praise clips in seconds (default: 10.0)"
+        default=4.0,
+        help="Maximum pause between praise clips in seconds (default: 4.0)"
     )
     
     parser.add_argument(
@@ -128,6 +166,18 @@ Examples:
         "--list", 
         action="store_true",
         help="List available audio files and exit"
+    )
+    
+    parser.add_argument(
+        "--no-keep-awake", 
+        action="store_true",
+        help="Disable built-in keep-awake daemon (computer may sleep)"
+    )
+    
+    parser.add_argument(
+        "--use-daemon", 
+        action="store_true",
+        help="Use daemon thread instead of caffeinate on macOS"
     )
     
     args = parser.parse_args()
@@ -154,6 +204,28 @@ Examples:
     print(f"📁 Directory: {args.dir}")
     print(f"🎵 Found {len(audio_files)} audio files")
     print(f"⏱️  Intervals: {args.min}-{args.max} seconds")
+    
+    # Start keep-awake mechanism unless disabled
+    caffeinate_process = None
+    if not args.no_keep_awake:
+        if sys.platform == "darwin" and not args.use_daemon:
+            # Use caffeinate on macOS by default for better reliability
+            caffeinate_process = start_caffeinate()
+            if caffeinate_process:
+                print(f"💤 Keep-awake: caffeinate enabled")
+            else:
+                # Fallback to daemon if caffeinate fails
+                daemon_thread = threading.Thread(target=keep_awake_daemon, daemon=True)
+                daemon_thread.start()
+                print(f"💤 Keep-awake: daemon enabled (caffeinate fallback)")
+        else:
+            # Use daemon thread (non-macOS or --use-daemon flag)
+            daemon_thread = threading.Thread(target=keep_awake_daemon, daemon=True)
+            daemon_thread.start()
+            print(f"💤 Keep-awake: daemon enabled")
+    else:
+        print(f"💤 Keep-awake: disabled")
+    
     print(f"🎯 Press Ctrl+C to stop")
     print()
     
@@ -176,6 +248,13 @@ Examples:
             
     except KeyboardInterrupt:
         print("\n👋 Goodbye! Caroline is still the goodest girl!")
+        # Clean up caffeinate process if it was started
+        if caffeinate_process:
+            try:
+                caffeinate_process.terminate()
+                caffeinate_process.wait(timeout=2)
+            except Exception:
+                pass
         sys.exit(0)
 
 if __name__ == "__main__":
